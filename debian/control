@@ -1,0 +1,22 @@
+Source: systemd-dehydrated
+Priority: optional
+Maintainer: Wojtek Porczyk <woju@invisiblethingslab.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.1.3
+Section: misc
+Homepage: https://github.com/woju/systemd-dehydrated
+Vcs-Browser: https://github.com/woju/systemd-dehydrated
+Vcs-Git: https://github.com/woju/systemd-dehydrated.git
+
+Package: systemd-dehydrated
+Architecture: all
+Description: Dehydrated integration with systemd
+ Adds dehydrated@.service and dehydrated@.timer templates, along with a Python
+ script that check ARI information.
+Depends:
+ dehydrated,
+ python3:any,
+ python3-cryptography,
+ python3-click,
+ python3-httpx,
+ ${misc:Depends},

@@ -1,0 +1,5 @@
+systemd-dehydrated (1.0) UNRELEASED; urgency=medium
+
+  * Initial release.
+
+ -- Wojtek Porczyk <woju@invisiblethingslab.com>  Thu, 15 Aug 2024 09:45:18 +0200

@@ -1,0 +1,4 @@
+dehydrated@.service lib/systemd/system
+dehydrated@.timer lib/systemd/system
+systemd-dehydrated-ari usr/bin
+systemd-dehydrated-ari.1 usr/share/man/man1

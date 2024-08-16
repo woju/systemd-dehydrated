@@ -1,0 +1,319 @@
+#!/usr/bin/python3 -O
+# SPDX-FileCopyrightText: (c) 2024 Wojtek Porczyk <woju@invisiblethingslab.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""
+Prerequisites:
+    sudo apt-get install python3-click python3-cryptography python3-httpx
+
+Usage:
+    [Service]
+    ExecCondition=/usr/local/bin/systemd_dehydrated_ari.py %I
+
+See also:
+    https://datatracker.ietf.org/doc/html/draft-ietf-acme-ari-04
+    https://letsencrypt.org/2024/04/25/guide-to-integrating-ari-into-existing-acme-clients.html
+"""
+
+__author__ = 'Wojtek Porczyk'
+__author_email__ = 'woju@invisiblethingslab.com'
+__version__ = '1.0'
+
+# As early as possible, install excepthook that will exit with 255. Any error
+# should result in the script terminating with 255 (cf. systemd.service(5))
+# fmt: off
+import sys
+def _excepthook(*args, **kwds):  # type: ignore
+    sys.__excepthook__(*args, **kwds)
+    sys.exit(255)
+sys.excepthook = _excepthook
+
+# pylint: disable=wrong-import-position,wrong-import-order
+
+import base64
+import datetime
+import itertools
+import logging
+import pathlib
+import re
+import secrets
+
+import click
+import cryptography.x509
+import httpx
+
+from typing import Optional
+# TODO after python (>= 3.11): Self
+
+class ARINeedRenewal(Exception):
+    """Raised when the certificate needs renewal"""
+
+
+class ARIError(Exception):
+    """Raised when an error occured and the script needs to exit abnormally"""
+
+
+_re_rfc3339 = re.compile(r'''
+    (?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})
+    T
+    (?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})
+    (\.(?P<fraction>\d+))?
+    (?P<timezone>Z|[+-]\d{2}:?\d{2})
+''', re.VERBOSE)
+# fmt: on
+
+
+def parse_rfc3339(timestamp: str) -> datetime.datetime:
+    """Parse RFC3339-compatible timestamp"""
+    # the need for this function (as opposed to just datetime.datetime.strptime)
+    # is because boulder returns nanoseconds, which is too much for poor
+    # Python's %f
+
+    match = _re_rfc3339.fullmatch(timestamp)
+    if not match:
+        raise ValueError(f'invalid RFC3339 timestamp: {timestamp!r}')
+    return datetime.datetime(
+        year=int(match['year']),
+        month=int(match['month']),
+        day=int(match['day']),
+        hour=int(match['hour']),
+        minute=int(match['minute']),
+        second=int(match['second']),
+        microsecond=(
+            round(int(match['fraction']) / 10 ** (len(match['fraction']) - 6))
+            if match['fraction'] is not None
+            else 0
+        ),
+        # NOTE: %z is glibc-only
+        tzinfo=datetime.datetime.strptime(match['timezone'], '%z').tzinfo,
+    )
+
+
+def load_dehydrated_cert(
+    domains: list[str],
+    *,
+    basedir: pathlib.Path = pathlib.Path('/var/lib/dehydrated'),
+) -> cryptography.x509.Certificate:
+    """Loads PEM certificate from dehydrated database"""
+    try:
+        with open(basedir / 'certs' / domains[0] / 'cert.pem', 'rb') as file:
+            return cryptography.x509.load_pem_x509_certificate(file.read())
+    except FileNotFoundError as exc:
+        raise ARINeedRenewal('Certificate not found, forcing renew') from exc
+
+
+def get_cert_id(cert: cryptography.x509.Certificate) -> str:
+    """Returns certificate's “unique identifier” as described in draft-04 4.1"""
+    aki = cert.extensions.get_extension_for_class(
+        cryptography.x509.AuthorityKeyIdentifier
+    ).value.key_identifier
+
+    # (+ 8) // 8 ensures that MSb is 0, so the number is positive (ASN.1 numbers
+    # are always signed and AFAIK serial needs to be positive, so this should
+    # match official DER encoding)
+    serial = cert.serial_number.to_bytes(
+        (cert.serial_number.bit_length() + 8) // 8, 'big'
+    )
+
+    return '.'.join(
+        base64.urlsafe_b64encode(i).rstrip(b'=').decode('ascii')
+        for i in (aki, serial)
+    )
+
+
+class CertChecker:
+    """Check if the cert needs renewal. See methods for what it can check."""
+
+    def __init__(
+        self,
+        cert: cryptography.x509.Certificate,
+        *,
+        now: Optional[datetime.datetime] = None,
+    ):
+        self.cert = cert
+        self.now = (
+            now
+            if now is not None
+            else datetime.datetime.now(datetime.timezone.utc)
+        )
+
+        self.cert_subject = self.cert.subject.rfc4514_string()
+        self.cert_not_after = self.cert.not_valid_after.replace(
+            tzinfo=datetime.timezone.utc
+        )
+        self.cert_id = get_cert_id(self.cert)
+
+        logging.debug(
+            f'Found certificate {self.cert_subject} id: {self.cert_id}'
+        )
+
+    def check_domains(self, domains: list[str]) -> None:
+        """Check if SAN matches requested set of domains.
+
+        If not, this means that the list of domains changed and we need to
+        reissue the certificate anyway.
+        """
+        if set(domains) != set(
+            self.cert.extensions.get_extension_for_oid(
+                cryptography.x509.OID_SUBJECT_ALTERNATIVE_NAME
+            ).value.get_values_for_type(cryptography.x509.DNSName)
+        ):
+            raise ARINeedRenewal(
+                'Certificate domains do not match requested domains'
+            )
+
+    def check_expired(self) -> None:
+        """Check if the cert is already expired"""
+        if self.now > self.cert_not_after:
+            raise ARINeedRenewal('Certificate already expired')
+
+    def check_ari(
+        self,
+        acme_directory: str = 'https://acme-v02.api.letsencrypt.org/directory',
+        period: datetime.timedelta = datetime.timedelta(hours=8),
+    ) -> None:
+        """Check ACME Renewal Information
+
+        This does network request to check if ACME CA thinks we need to renew
+        the certificate. On normal schedule, the CA might suggest to renew about
+        a month before notAfter (at the time of this writing that's what Let's
+        Encrypt does), but in case of an incident the CA might suddenly come
+        under obligation to revoke the cert in 120 h or even 24 h, in which case
+        it will change it's suggestion to some time sooner.
+        """
+        # Based on RECOMMENDED algorithm:
+        # https://datatracker.ietf.org/doc/html/draft-ietf-acme-ari-04#section-4.2
+        # However, we can't reschedule (this is done by cron or systemd.timer),
+        # so 4. is N/A for us and condition 3. is contained within 5. (if time
+        # is in the past, it's also before next schedule). Therefore we just
+        # check 5.
+
+        with httpx.Client(
+            headers={'user-agent': f'systemd-dehydrated-ari/{__version__}'}
+        ) as http:
+            resp = http.get(acme_directory)
+            resp.raise_for_status()
+            try:
+                renewal_info_base = resp.json()['renewalInfo']
+            except KeyError as exc:
+                raise ARIError(
+                    'no renewalInfo in ACME directory, ARI unsupported'
+                ) from exc
+
+            resp = http.get(f'{renewal_info_base}/{self.cert_id}')
+            if resp.status_code == 404:
+                raise ARINeedRenewal('ARI returned 404, probably need to renew')
+
+            resp.raise_for_status()
+            renewal_info = resp.json()
+
+        logging.debug(f'renewal info: {renewal_info}')
+
+        # 1.
+        start = parse_rfc3339(renewal_info['suggestedWindow']['start'])
+        end = parse_rfc3339(renewal_info['suggestedWindow']['end'])
+
+        # 2.
+        selected = start + datetime.timedelta(
+            seconds=secrets.randbelow(int((end - start).total_seconds()))
+        )
+
+        logging.debug(f'now:       {self.now.isoformat()}')
+        logging.debug(f'start:     {start.isoformat()}')
+        logging.debug(f'selected:  {selected.isoformat()}')
+        logging.debug(f'end:       {end.isoformat()}')
+        logging.debug(f'not after: {self.cert_not_after.isoformat()}')
+
+        # 5. (also includes 3.)
+        if selected < self.now + period:
+            raise ARINeedRenewal(
+                f'needs renewal, explanation: '
+                f'{renewal_info.get("explanationURL", "(none)")}'
+            )
+
+        # sanity check for ARI: if the end of validity is later than notAfter, force
+        # renewal
+        if end > self.cert_not_after:
+            logging.critical(
+                f'ARI indicates end of renewal after notAfter, which is probably '
+                f'a bug; forcing renewal for caution. Debug info:'
+                f' {self.cert_id=}'
+                f' {self.now=}'
+                f' {self.cert_not_after=}'
+                f' {renewal_info=}'
+            )
+
+            raise ARINeedRenewal('ARI fault')
+
+
+def seconds_type(value: str) -> datetime.timedelta:
+    """Timedelta type suitable for use in @click.option(type=)"""
+    return datetime.timedelta(seconds=int(value))
+
+
+# fmt: off
+@click.command(context_settings={'show_default': True})
+@click.option('--acme-directory', metavar='URI',
+    default='https://acme-v02.api.letsencrypt.org/directory',
+    help='ACME directory URI')
+@click.option('--debug/--no-debug', '-d/',
+    help='Enable debug logging')
+@click.option('--dehydrated-basedir', type=click.Path( # type: ignore
+        exists=True, file_okay=False, dir_okay=True, path_type=pathlib.Path),
+    default='/var/lib/dehydrated',
+    help='Path to dehydrated database directory')
+@click.option('--period', metavar='SECONDS',
+    type=seconds_type, default=28800,
+    help='Assume the script will be called once per this amount of time in s '
+        ' [default: 28800 s, which is 8 h or 3 times per day]',
+    show_default=False)
+@click.argument('domains', nargs=-1, required=True)
+@click.pass_context
+# fmt: on
+def main(
+    ctx: click.Context,
+    acme_directory: str,
+    debug: bool,
+    dehydrated_basedir: pathlib.Path,
+    period: datetime.timedelta,
+    domains: list[str],
+) -> None:
+    # pylint: disable=too-many-arguments,missing-function-docstring
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.WARNING,
+        format='%(asctime)s %(message)s',
+    )
+
+    domains = list(itertools.chain.from_iterable(i.split() for i in domains))
+
+    logging.info(
+        f'ari.py {__version__} '
+        f'for domains {",".join(domains)} '
+        f'with period {period}'
+    )
+
+    try:
+        cert = load_dehydrated_cert(domains, basedir=dehydrated_basedir)
+        checker = CertChecker(cert)
+        checker.check_domains(domains)
+        checker.check_expired()
+        checker.check_ari(acme_directory=acme_directory, period=period)
+
+    except ARINeedRenewal as exc:
+        logging.warning(f'{exc}, forcing renew')
+        ctx.exit(1)
+
+    except ARIError as exc:
+        logging.error(exc)
+        ctx.exit(255)
+
+    else:
+        logging.info('Certificate looks okay')
+        ctx.exit(0)
+
+
+if __name__ == '__main__':
+    main()  # pylint: disable=no-value-for-parameter
+
+
+# vim: tw=80

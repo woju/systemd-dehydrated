@@ -1,0 +1,9 @@
+[Unit]
+Description=ACME cert refresh for %I
+After=nginx.service network-online.target
+
+[Service]
+Type=oneshot
+User=dehydrated
+ExecCondition=/usr/bin/systemd-dehydrated-ari %I
+ExecStart=/usr/bin/dehydrated --cron --force --domain %I

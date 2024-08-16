@@ -1,0 +1,42 @@
+.TH systemd-dehydrated-ari 1
+.SH NAME
+systemd-dehydrated-ari \- Check if a dehydrated certificate needs renewal
+.SH SYNOPSIS
+.B systemd-dehydrated-ari
+[\fIOPTIONS\fR]
+.IR DOMAIN ...
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show help and exit.
+.TP
+.BR \-\-acme-directory =\fIURI\fR
+Change ACME directory URI (change CA).
+The default is Let's Encrypt (https://acme-v02.api.letsencrypt.org/directory)
+.TP
+.BR \-d ", " \-\-debug
+Enable debug logging
+.TP
+.B \-\-no\-debug
+Disable debug logging
+.TP
+.BR \-\-dehydrated\-basedir \=\fIPATH\fR
+Path to dehydrated database directory. Default: /var/lib/dehydrated.
+.TP
+.BR \-\-period \=\fISECONDS\fR
+Assume the script will be called once per this amount of time in seconds.
+By default this is 28800 s, which is 8 h or 3 times per day.
+.SH EXIT CODE
+The script is designed to work well with ExecCondition= option to
+.BR systemd.unit (5)
+.TP
+.B 0
+The certificate needs to renew.
+.TP
+.B 1
+The certificate does not need to renew.
+.TP
+.B 255
+Internal script error.
+.SH AUTHOR
+Wojtek Porczyk

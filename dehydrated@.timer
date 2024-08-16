@@ -1,0 +1,10 @@
+[Unit]
+Description=ACME cert refresh for %I
+
+[Timer]
+OnCalendar=*-*-* 3,11,19:01:25 UTC
+RandomizedDelaySec=15 min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

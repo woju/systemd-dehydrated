@@ -1,0 +1,38 @@
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+
+jobs:
+  pylint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install python3-httpx
+      - run: sudo apt-get install pylint
+      - run: pylint systemd-dehydrated-ari
+  black:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install python3-httpx
+      - run: sudo apt-get install black
+      - run: black --check --diff .
+  mypy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install python3-httpx
+      - run: sudo apt-get install mypy
+      - run: mypy
+  debuild:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install devscripts lintian
+      - run: sudo apt-get build-dep ./
+      - run: debuild --no-lintian
+      - run: lintian -i
