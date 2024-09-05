@@ -301,7 +301,7 @@ def main(
 
     except ARINeedRenewal as exc:
         logging.warning(f'{exc}, forcing renew')
-        ctx.exit(1)
+        ctx.exit(0)
 
     except ARIError as exc:
         logging.error(exc)
@@ -309,7 +309,7 @@ def main(
 
     else:
         logging.info('Certificate looks okay')
-        ctx.exit(0)
+        ctx.exit(1)
 
 
 if __name__ == '__main__':
