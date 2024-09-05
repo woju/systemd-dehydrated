@@ -17,7 +17,7 @@ See also:
 
 __author__ = 'Wojtek Porczyk'
 __author_email__ = 'woju@invisiblethingslab.com'
-__version__ = '1.0'
+__version__ = '1.1'
 
 # As early as possible, install excepthook that will exit with 255. Any error
 # should result in the script terminating with 255 (cf. systemd.service(5))
