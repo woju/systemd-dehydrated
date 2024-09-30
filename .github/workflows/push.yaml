@@ -28,11 +28,11 @@ jobs:
       - run: sudo apt-get install python3-httpx
       - run: sudo apt-get install mypy
       - run: mypy
-  debuild:
+  deb:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get install devscripts lintian
+      - run: sudo apt-get install lintian
       - run: sudo apt-get build-dep ./
-      - run: debuild --no-lintian
+      - run: dpkg-buildpackage --no-sign
       - run: lintian -i
